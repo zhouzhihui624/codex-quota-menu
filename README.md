@@ -2,7 +2,9 @@
 
 一个轻量的原生 macOS 菜单栏工具，按两行五格样式实时显示 Codex 的 5 小时和 7 天剩余额度。
 
-![Codex 实时额度菜单栏示意图](preview.png)
+真实菜单栏截图：
+
+![Codex 实时额度菜单栏截图](screenshot.png)
 
 ## 功能
 
