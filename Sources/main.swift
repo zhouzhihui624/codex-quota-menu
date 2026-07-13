@@ -21,15 +21,17 @@ private struct UsageResponse: Decodable {
         struct Window: Decodable {
             let usedPercent: Double
             let resetAt: TimeInterval?
+            let durationSeconds: TimeInterval?
 
             enum CodingKeys: String, CodingKey {
                 case usedPercent = "used_percent"
                 case resetAt = "reset_at"
+                case durationSeconds = "limit_window_seconds"
             }
         }
 
-        let primaryWindow: Window
-        let secondaryWindow: Window
+        let primaryWindow: Window?
+        let secondaryWindow: Window?
 
         enum CodingKeys: String, CodingKey {
             case primaryWindow = "primary_window"
@@ -45,8 +47,8 @@ private struct UsageResponse: Decodable {
 }
 
 private struct QuotaSnapshot {
-    let fiveHourRemainingPercent: Double
-    let weeklyRemainingPercent: Double
+    let fiveHourRemainingPercent: Double?
+    let weeklyRemainingPercent: Double?
     let fiveHourResetAt: Date?
     let weeklyResetAt: Date?
     let updatedAt: Date
@@ -75,6 +77,34 @@ private final class QuotaService {
     private let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
 
     func fetch() async throws -> QuotaSnapshot {
+        var partial = PartialSnapshot()
+        var originalError: Error?
+
+        do {
+            partial = try await self.fetchFromHTTP()
+        } catch {
+            originalError = error
+        }
+
+        if partial.fiveHour == nil || partial.weekly == nil,
+           let local = await CodexAppServerRateLimits.fetch()
+        {
+            partial.mergeMissing(from: local)
+        }
+
+        guard partial.fiveHour != nil || partial.weekly != nil else {
+            throw originalError ?? QuotaError.invalidResponse
+        }
+
+        return QuotaSnapshot(
+            fiveHourRemainingPercent: partial.fiveHour?.remainingPercent,
+            weeklyRemainingPercent: partial.weekly?.remainingPercent,
+            fiveHourResetAt: partial.fiveHour?.resetAt,
+            weeklyResetAt: partial.weekly?.resetAt,
+            updatedAt: Date())
+    }
+
+    private func fetchFromHTTP() async throws -> PartialSnapshot {
         let authData: Data
         do {
             authData = try Data(contentsOf: self.authURL)
@@ -110,12 +140,19 @@ private final class QuotaService {
             throw QuotaError.invalidResponse
         }
 
-        return QuotaSnapshot(
-            fiveHourRemainingPercent: Self.remaining(fromUsed: usage.rateLimit.primaryWindow.usedPercent),
-            weeklyRemainingPercent: Self.remaining(fromUsed: usage.rateLimit.secondaryWindow.usedPercent),
-            fiveHourResetAt: usage.rateLimit.primaryWindow.resetAt.map(Date.init(timeIntervalSince1970:)),
-            weeklyResetAt: usage.rateLimit.secondaryWindow.resetAt.map(Date.init(timeIntervalSince1970:)),
-            updatedAt: Date())
+        var result = PartialSnapshot()
+        Self.add(usage.rateLimit.primaryWindow, legacyKind: .fiveHour, to: &result)
+        Self.add(usage.rateLimit.secondaryWindow, legacyKind: .weekly, to: &result)
+        return result
+    }
+
+    private static func add(_ window: UsageResponse.RateLimit.Window?, legacyKind: WindowKind, to result: inout PartialSnapshot) {
+        guard let window else { return }
+        let kind = window.durationSeconds.map(WindowKind.fromDuration(seconds:)) ?? legacyKind
+        let value = QuotaWindow(
+            remainingPercent: self.remaining(fromUsed: window.usedPercent),
+            resetAt: window.resetAt.map(Date.init(timeIntervalSince1970:)))
+        result.set(value, for: kind)
     }
 
     private static func clamp(_ value: Double) -> Double {
@@ -124,6 +161,108 @@ private final class QuotaService {
 
     private static func remaining(fromUsed usedPercent: Double) -> Double {
         self.clamp(100 - usedPercent)
+    }
+}
+
+private enum WindowKind { case fiveHour, weekly
+    static func fromDuration(seconds: TimeInterval) -> WindowKind {
+        seconds < 24 * 60 * 60 ? .fiveHour : .weekly
+    }
+}
+
+private struct QuotaWindow {
+    let remainingPercent: Double
+    let resetAt: Date?
+}
+
+private struct PartialSnapshot {
+    var fiveHour: QuotaWindow?
+    var weekly: QuotaWindow?
+
+    mutating func set(_ value: QuotaWindow, for kind: WindowKind) {
+        switch kind { case .fiveHour: self.fiveHour = value; case .weekly: self.weekly = value }
+    }
+
+    mutating func mergeMissing(from other: PartialSnapshot) {
+        if self.fiveHour == nil { self.fiveHour = other.fiveHour }
+        if self.weekly == nil { self.weekly = other.weekly }
+    }
+}
+
+private enum CodexAppServerRateLimits {
+    static func fetch() async -> PartialSnapshot? {
+        await Task.detached(priority: .utility) { self.fetchSynchronously() }.value
+    }
+
+    private static func fetchSynchronously() -> PartialSnapshot? {
+        guard let executable = self.executableURL() else { return nil }
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = executable
+        process.arguments = ["app-server", "--listen", "stdio://"]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do { try process.run() } catch { return nil }
+        let messages = [
+            #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-quota-menu","version":"1.1.0"}}}"#,
+            #"{"method":"initialized"}"#,
+            #"{"id":2,"method":"account/rateLimits/read","params":null}"#,
+        ].joined(separator: "\n") + "\n"
+        try? input.fileHandleForWriting.write(contentsOf: Data(messages.utf8))
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 8) {
+            if process.isRunning { process.terminate() }
+        }
+
+        var buffer = Data()
+        while process.isRunning {
+            let chunk = output.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[..<newline]
+                buffer.removeSubrange(...newline)
+                if let result = self.parseResponse(Data(line)) {
+                    process.terminate()
+                    return result
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func parseResponse(_ data: Data) -> PartialSnapshot? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (root["id"] as? NSNumber)?.intValue == 2,
+              let result = root["result"] as? [String: Any],
+              let limits = result["rateLimits"] as? [String: Any]
+        else { return nil }
+
+        var snapshot = PartialSnapshot()
+        self.add(limits["primary"] as? [String: Any], legacyKind: .fiveHour, to: &snapshot)
+        self.add(limits["secondary"] as? [String: Any], legacyKind: .weekly, to: &snapshot)
+        return snapshot
+    }
+
+    private static func add(_ window: [String: Any]?, legacyKind: WindowKind, to result: inout PartialSnapshot) {
+        guard let window, let used = (window["usedPercent"] as? NSNumber)?.doubleValue else { return }
+        let minutes = (window["windowDurationMins"] as? NSNumber)?.doubleValue
+        let kind = minutes.map { WindowKind.fromDuration(seconds: $0 * 60) } ?? legacyKind
+        let reset = (window["resetsAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+        result.set(QuotaWindow(remainingPercent: min(100, max(0, 100 - used)), resetAt: reset), for: kind)
+    }
+
+    private static func executableURL() -> URL? {
+        let paths = [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+        ]
+        return paths.first(where: FileManager.default.isExecutableFile(atPath:)).map(URL.init(fileURLWithPath:))
     }
 }
 
@@ -140,6 +279,13 @@ private enum QuotaImageRenderer {
         weeklyPercent: Double?,
         appearance: NSAppearance?) -> NSImage
     {
+        if fiveHourPercent == nil, let weeklyPercent {
+            return self.renderSingle(label: "7d", percent: weeklyPercent, appearance: appearance)
+        }
+        if weeklyPercent == nil, let fiveHourPercent {
+            return self.renderSingle(label: "5h", percent: fiveHourPercent, appearance: appearance)
+        }
+
         let image = NSImage(size: self.canvasSize(
             fiveHourPercent: fiveHourPercent,
             weeklyPercent: weeklyPercent))
@@ -151,6 +297,60 @@ private enum QuotaImageRenderer {
             self.drawRow(label: "7d", percent: weeklyPercent, y: 1)
         }
 
+        if let appearance {
+            appearance.performAsCurrentDrawingAppearance(draw)
+        } else {
+            draw()
+        }
+        image.isTemplate = false
+        return image
+    }
+
+    private static func renderSingle(label: String, percent: Double, appearance: NSAppearance?) -> NSImage {
+        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let labelWidth = (label as NSString).size(withAttributes: attributes).width
+        let percentText = self.percentText(percent)
+        let percentWidth = (percentText as NSString).size(withAttributes: attributes).width
+        let blockWidth: CGFloat = 7
+        let blockGap: CGFloat = 2
+        let textGap: CGFloat = 4
+        let blockX = ceil(labelWidth + textGap)
+        let percentX = blockX + 5 * blockWidth + 4 * blockGap + textGap
+        let image = NSImage(size: NSSize(width: ceil(percentX + percentWidth), height: self.height))
+        image.lockFocus()
+        defer { image.unlockFocus() }
+
+        let draw = {
+            let textAttributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.labelColor,
+            ]
+            (label as NSString).draw(at: NSPoint(x: 0, y: 4), withAttributes: textAttributes)
+            let filledCount = min(5, max(0, Int(round(percent / 20))))
+            let activeColor: NSColor = if percent >= 50 {
+                .systemGreen
+            } else if percent >= 20 {
+                .systemOrange
+            } else {
+                .systemRed
+            }
+            for index in 0..<5 {
+                let rect = NSRect(
+                    x: blockX + CGFloat(index) * (blockWidth + blockGap),
+                    y: 6,
+                    width: blockWidth,
+                    height: 10)
+                let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
+                if index < filledCount {
+                    activeColor.setFill()
+                } else {
+                    NSColor.systemBlue.withAlphaComponent(0.22).setFill()
+                }
+                path.fill()
+            }
+            (percentText as NSString).draw(at: NSPoint(x: percentX, y: 4), withAttributes: textAttributes)
+        }
         if let appearance {
             appearance.performAsCurrentDrawingAppearance(draw)
         } else {
@@ -336,7 +536,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         button.image = image
 
         if let snapshot = self.lastSnapshot {
-            button.toolTip = "Codex 剩余额度：5h \(Int(round(snapshot.fiveHourRemainingPercent)))%，7d \(Int(round(snapshot.weeklyRemainingPercent)))%"
+            let available = [
+                snapshot.fiveHourRemainingPercent.map { "5h \(Self.percentText($0))" },
+                snapshot.weeklyRemainingPercent.map { "7d \(Self.percentText($0))" },
+            ].compactMap { $0 }.joined(separator: "，")
+            button.toolTip = "Codex 剩余额度：\(available)"
         } else if let lastError {
             button.toolTip = "Codex 额度读取失败：\(lastError.localizedDescription)"
         } else {
@@ -352,12 +556,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         if let snapshot = self.lastSnapshot {
-            menu.addItem(self.infoItem(
-                title: "5 小时：剩余 \(Int(round(snapshot.fiveHourRemainingPercent)))%",
-                resetAt: snapshot.fiveHourResetAt))
-            menu.addItem(self.infoItem(
-                title: "7 天：剩余 \(Int(round(snapshot.weeklyRemainingPercent)))%",
-                resetAt: snapshot.weeklyResetAt))
+            if let fiveHour = snapshot.fiveHourRemainingPercent {
+                menu.addItem(self.infoItem(
+                    title: "5 小时：剩余 \(Self.percentText(fiveHour))",
+                    resetAt: snapshot.fiveHourResetAt))
+            }
+            if let weekly = snapshot.weeklyRemainingPercent {
+                menu.addItem(self.infoItem(
+                    title: "7 天：剩余 \(Self.percentText(weekly))",
+                    resetAt: snapshot.weeklyResetAt))
+            }
             let updated = NSMenuItem(
                 title: "更新于 \(Self.timeFormatter.string(from: snapshot.updatedAt))",
                 action: nil,
@@ -400,6 +608,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem(title: title + suffix, action: nil, keyEquivalent: "")
         item.isEnabled = false
         return item
+    }
+
+    private static func percentText(_ percent: Double?) -> String {
+        percent.map { "\(Int(round($0)))%" } ?? "--%"
     }
 
     @objc private func openUsagePage() {
