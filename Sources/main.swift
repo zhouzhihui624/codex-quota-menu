@@ -683,8 +683,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func updateImage() {
         guard self.statusItem != nil || self.barButton != nil else { return }
-        let appearance = self.statusItem?.button?.effectiveAppearance
-            ?? self.barButton?.effectiveAppearance
+        let appearance = self.barButton == nil
+            ? self.statusItem?.button?.effectiveAppearance
+            : NSAppearance(named: .darkAqua)
         let image = QuotaImageRenderer.render(
             fiveHourPercent: self.lastSnapshot?.fiveHourRemainingPercent,
             weeklyPercent: self.lastSnapshot?.weeklyRemainingPercent,
