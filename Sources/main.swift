@@ -549,9 +549,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard let panel = self.barPanel,
               let screen = self.barScreen else { return }
         let configuredInset = UserDefaults.standard.object(forKey: overlayRightInsetPreferenceKey) as? Double
-        let rightInset = max(0, configuredInset.map { CGFloat($0) } ?? 586)
+        let x: CGFloat
+        if let configuredInset {
+            let rightInset = max(0, CGFloat(configuredInset))
+            x = screen.frame.maxX - rightInset - panel.frame.width
+        } else if let statusItemsStart = self.controlCenterMenuBarFrames(on: screen).map(\.minX).min() {
+            x = statusItemsStart - 8 - panel.frame.width
+        } else {
+            x = screen.frame.maxX - 586 - panel.frame.width
+        }
         panel.setFrameOrigin(NSPoint(
-            x: screen.frame.maxX - rightInset - panel.frame.width,
+            x: max(screen.frame.minX, x),
             y: screen.frame.maxY - 27))
     }
 
@@ -578,9 +586,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             ?? screen.frame.maxY
         let expectedX = screen.frame.minX
         let expectedY = primaryMaxY - screen.frame.maxY
-        let controlCenterPID = NSWorkspace.shared.runningApplications.first {
-            $0.bundleIdentifier == "com.apple.controlcenter" && !$0.isTerminated
-        }?.processIdentifier
+        if self.controlCenterMenuBarFrames(on: screen).contains(where: {
+            abs($0.minY - expectedY) <= 2
+        }) {
+            return true
+        }
 
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
             as? [[String: Any]] else { return false }
@@ -594,15 +604,40 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                   let y = (bounds["Y"] as? NSNumber)?.doubleValue,
                   let width = (bounds["Width"] as? NSNumber)?.doubleValue,
                   let height = (bounds["Height"] as? NSNumber)?.doubleValue else { return false }
-            let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-            let isControlCenterItem = ownerPID == controlCenterPID
-                && x >= screen.frame.minX - 2
-                && x + width <= screen.frame.maxX + 2
             let isFullWidthMenu = abs(x - expectedX) <= 2
                 && width >= screen.frame.width - 2
             return abs(y - expectedY) <= 2
                 && (20...40).contains(height)
-                && (isControlCenterItem || isFullWidthMenu)
+                && isFullWidthMenu
+        }
+    }
+
+    private func controlCenterMenuBarFrames(on screen: NSScreen) -> [CGRect] {
+        guard let controlCenterPID = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "com.apple.controlcenter" && !$0.isTerminated
+        })?.processIdentifier,
+            let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]]
+        else { return [] }
+
+        let primaryMaxY = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.maxY
+            ?? NSScreen.screens.first?.frame.maxY
+            ?? screen.frame.maxY
+        let expectedY = primaryMaxY - screen.frame.maxY
+
+        return windows.compactMap { window in
+            guard (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 25,
+                  (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == controlCenterPID,
+                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let x = (bounds["X"] as? NSNumber)?.doubleValue,
+                  let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+                  let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+                  let height = (bounds["Height"] as? NSNumber)?.doubleValue,
+                  (20...40).contains(height),
+                  abs(y - expectedY) <= 120,
+                  x >= screen.frame.minX - 2,
+                  x + width <= screen.frame.maxX + 2
+            else { return nil }
+            return CGRect(x: x, y: y, width: width, height: height)
         }
     }
 

@@ -51,7 +51,7 @@ defaults write local.codex.quota-menu UseOverlayMenuBar -bool true
 launchctl kickstart -k "gui/$(id -u)/local.codex.quota-menu"
 ```
 
-兼容浮层只在系统菜单栏可见或从全屏中展开时出现，并保留点击查看详情、手动刷新和打开用量页面的功能。默认位置不合适时，可以调整距屏幕右侧的距离（单位为点）：
+兼容浮层只在系统菜单栏可见或从全屏中展开时出现，并保留点击查看详情、手动刷新和打开用量页面的功能。浮层会自动放在当前屏幕系统状态项的左侧；如需覆盖自动位置，可以设置距屏幕右侧的距离（单位为点）：
 
 ```bash
 defaults write local.codex.quota-menu OverlayRightInset -float 586
