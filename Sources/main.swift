@@ -1,8 +1,11 @@
 import AppKit
+import CoreGraphics
 import Foundation
 
 private let codexBundleIdentifier = "com.openai.codex"
 private let statusItemAutosaveName = "codex-quota-menu"
+private let overlayModePreferenceKey = "UseOverlayMenuBar"
+private let overlayRightInsetPreferenceKey = "OverlayRightInset"
 
 private struct AuthFile: Decodable {
     struct Tokens: Decodable {
@@ -423,15 +426,25 @@ private enum QuotaImageRenderer {
     }
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let quotaService = QuotaService()
     private var statusItem: NSStatusItem?
+    private var barPanel: NSPanel?
+    private var barButton: NSButton?
+    private var barScreen: NSScreen?
     private var processTimer: Timer?
     private var refreshTimer: Timer?
+    private var visibilityTimer: Timer?
     private var refreshTask: Task<Void, Never>?
     private var lastSnapshot: QuotaSnapshot?
     private var lastError: Error?
     private var codexWasRunning = false
+    private var overlayMenuIsOpen = false
+
+    private var usesOverlayStatusItem: Bool {
+        ProcessInfo.processInfo.environment["CODEX_QUOTA_MENU_OVERLAY"] == "1"
+            || UserDefaults.standard.bool(forKey: overlayModePreferenceKey)
+    }
 
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -444,6 +457,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_: Notification) {
         self.processTimer?.invalidate()
         self.refreshTimer?.invalidate()
+        self.visibilityTimer?.invalidate()
         self.refreshTask?.cancel()
     }
 
@@ -468,22 +482,128 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showStatusItem() {
-        guard self.statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: 64)
-        item.autosaveName = statusItemAutosaveName
-        item.button?.imagePosition = .imageOnly
-        item.button?.imageScaling = .scaleNone
-        item.button?.toolTip = "Codex 额度"
-        item.menu = self.makeMenu()
-        self.statusItem = item
+        if !self.usesOverlayStatusItem {
+            guard self.statusItem == nil else { return }
+            let item = NSStatusBar.system.statusItem(withLength: 64)
+            item.autosaveName = statusItemAutosaveName
+            item.button?.imagePosition = .imageOnly
+            item.button?.imageScaling = .scaleNone
+            item.button?.toolTip = "Codex 额度"
+            item.menu = self.makeMenu()
+            self.statusItem = item
+            self.updateImage()
+            return
+        }
+
+        guard self.barPanel == nil else { return }
+        let size = NSSize(width: 64, height: 22)
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .popUpMenu
+        panel.ignoresMouseEvents = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let button = NSButton(frame: NSRect(origin: .zero, size: size))
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
+        button.target = self
+        button.action = #selector(self.openOverlayMenu(_:))
+        panel.contentView = button
+        self.barPanel = panel
+        self.barButton = button
+        self.barScreen = NSScreen.main ?? NSScreen.screens.first
+        self.positionMenuBarPanel()
+        self.updatePanelVisibility()
+
+        self.visibilityTimer?.invalidate()
+        self.visibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updatePanelVisibility() }
+        }
         self.updateImage()
     }
 
     private func hideStatusItem() {
-        guard let item = self.statusItem else { return }
-        item.menu = nil
-        NSStatusBar.system.removeStatusItem(item)
-        self.statusItem = nil
+        if let item = self.statusItem {
+            item.menu = nil
+            NSStatusBar.system.removeStatusItem(item)
+            self.statusItem = nil
+        }
+        self.visibilityTimer?.invalidate()
+        self.visibilityTimer = nil
+        self.barPanel?.orderOut(nil)
+        self.barPanel = nil
+        self.barButton = nil
+        self.barScreen = nil
+        self.overlayMenuIsOpen = false
+    }
+
+    private func positionMenuBarPanel() {
+        guard let panel = self.barPanel,
+              let screen = self.barScreen else { return }
+        let configuredInset = UserDefaults.standard.object(forKey: overlayRightInsetPreferenceKey) as? Double
+        let rightInset = max(0, configuredInset.map { CGFloat($0) } ?? 586)
+        panel.setFrameOrigin(NSPoint(
+            x: screen.frame.maxX - rightInset - panel.frame.width,
+            y: screen.frame.maxY - 27))
+    }
+
+    private func updatePanelVisibility() {
+        guard let panel = self.barPanel else { return }
+        if self.overlayMenuIsOpen || self.isSystemMenuBarVisible() {
+            if !panel.isVisible {
+                panel.orderFrontRegardless()
+            }
+        } else if panel.isVisible {
+            panel.orderOut(nil)
+        }
+    }
+
+    private func isSystemMenuBarVisible() -> Bool {
+        guard let screen = self.barScreen else { return false }
+        let mouse = NSEvent.mouseLocation
+        if screen.frame.contains(mouse), mouse.y >= screen.frame.maxY - 40 {
+            return true
+        }
+
+        let primaryMaxY = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.maxY
+            ?? NSScreen.screens.first?.frame.maxY
+            ?? screen.frame.maxY
+        let expectedX = screen.frame.minX
+        let expectedY = primaryMaxY - screen.frame.maxY
+        let controlCenterPID = NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == "com.apple.controlcenter" && !$0.isTerminated
+        }?.processIdentifier
+
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+            as? [[String: Any]] else { return false }
+        return windows.contains { window in
+            guard let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                  (25...30).contains(layer),
+                  let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
+                  alpha > 0.5,
+                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let x = (bounds["X"] as? NSNumber)?.doubleValue,
+                  let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+                  let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+                  let height = (bounds["Height"] as? NSNumber)?.doubleValue else { return false }
+            let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let isControlCenterItem = ownerPID == controlCenterPID
+                && x >= screen.frame.minX - 2
+                && x + width <= screen.frame.maxX + 2
+            let isFullWidthMenu = abs(x - expectedX) <= 2
+                && width >= screen.frame.width - 2
+            return abs(y - expectedY) <= 2
+                && (20...40).contains(height)
+                && (isControlCenterItem || isFullWidthMenu)
+        }
     }
 
     private func startRefreshing() {
@@ -527,29 +647,41 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateImage() {
-        guard let button = self.statusItem?.button else { return }
+        guard self.statusItem != nil || self.barButton != nil else { return }
+        let appearance = self.statusItem?.button?.effectiveAppearance
+            ?? self.barButton?.effectiveAppearance
         let image = QuotaImageRenderer.render(
             fiveHourPercent: self.lastSnapshot?.fiveHourRemainingPercent,
             weeklyPercent: self.lastSnapshot?.weeklyRemainingPercent,
-            appearance: button.effectiveAppearance)
-        self.statusItem?.length = image.size.width
-        button.image = image
+            appearance: appearance)
 
-        if let snapshot = self.lastSnapshot {
-            let available = [
-                snapshot.fiveHourRemainingPercent.map { "5h \(Self.percentText($0))" },
-                snapshot.weeklyRemainingPercent.map { "7d \(Self.percentText($0))" },
-            ].compactMap { $0 }.joined(separator: "，")
-            button.toolTip = "Codex 剩余额度：\(available)"
-        } else if let lastError {
-            button.toolTip = "Codex 额度读取失败：\(lastError.localizedDescription)"
-        } else {
-            button.toolTip = "正在读取 Codex 额度…"
+        if let button = self.statusItem?.button {
+            self.statusItem?.length = image.size.width
+            button.image = image
+            if let snapshot = self.lastSnapshot {
+                let available = [
+                    snapshot.fiveHourRemainingPercent.map { "5h \(Self.percentText($0))" },
+                    snapshot.weeklyRemainingPercent.map { "7d \(Self.percentText($0))" },
+                ].compactMap { $0 }.joined(separator: "，")
+                button.toolTip = "Codex 剩余额度：\(available)"
+            } else if let lastError {
+                button.toolTip = "Codex 额度读取失败：\(lastError.localizedDescription)"
+            } else {
+                button.toolTip = "正在读取 Codex 额度…"
+            }
+        }
+
+        if let button = self.barButton {
+            button.image = image
+            button.frame = NSRect(origin: .zero, size: image.size)
+            self.barPanel?.setContentSize(image.size)
+            self.positionMenuBarPanel()
         }
     }
 
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
         let title = NSMenuItem(title: "Codex 实时额度", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
@@ -601,6 +733,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         binding.isEnabled = false
         menu.addItem(binding)
         return menu
+    }
+
+    @objc private func openOverlayMenu(_ sender: NSButton) {
+        let menu = self.makeMenu()
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
+    }
+
+    func menuWillOpen(_: NSMenu) {
+        self.overlayMenuIsOpen = true
+    }
+
+    func menuDidClose(_: NSMenu) {
+        self.overlayMenuIsOpen = false
+        self.updatePanelVisibility()
     }
 
     private func infoItem(title: String, resetAt: Date?) -> NSMenuItem {

@@ -42,6 +42,29 @@ cd codex-quota-menu
 
 如果没有 Swift 编译器，请先运行 `xcode-select --install` 安装 Apple Command Line Tools。
 
+### macOS 26 菜单栏兼容模式
+
+如果系统设置中已允许 `Codex 实时额度` 显示在菜单栏，但原生状态项仍不可见，可以启用兼容浮层：
+
+```bash
+defaults write local.codex.quota-menu UseOverlayMenuBar -bool true
+launchctl kickstart -k "gui/$(id -u)/local.codex.quota-menu"
+```
+
+兼容浮层只在系统菜单栏可见或从全屏中展开时出现，并保留点击查看详情、手动刷新和打开用量页面的功能。默认位置不合适时，可以调整距屏幕右侧的距离（单位为点）：
+
+```bash
+defaults write local.codex.quota-menu OverlayRightInset -float 586
+launchctl kickstart -k "gui/$(id -u)/local.codex.quota-menu"
+```
+
+恢复原生状态项：
+
+```bash
+defaults delete local.codex.quota-menu UseOverlayMenuBar
+launchctl kickstart -k "gui/$(id -u)/local.codex.quota-menu"
+```
+
 ## 卸载
 
 ```bash
